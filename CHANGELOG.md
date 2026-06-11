@@ -1,3 +1,9 @@
-## 0.0.1
+## 1.3.0
 
-* TODO: Describe initial release.
+* Add `InstallerMode` enum and `setInstallerMode()` to choose Dhizuku or Shizuku/Sui explicitly
+* Lazy-init installer backends based on selected mode instead of always preferring Dhizuku
+* **Behavior change:** default mode is Shizuku when `setInstallerMode` is not called (previously Dhizuku was tried first automatically)
+
+## 1.2.0
+
+* Updated dependencies; Android 8.0 minimum required
