@@ -40,6 +40,8 @@ import kotlin.coroutines.resume
 import kotlin.coroutines.suspendCoroutine
 
 class ShizukuWorker(private val appContext: Context) {
+    private var installerMode: InstallerMode = InstallerMode.SHIZUKU
+
     private var isBinderAvailable = false
     private val requestPermissionCode = (1000..2000).random()
     private val requestPermissionMutex by lazy { Mutex(locked = true) }
@@ -48,6 +50,8 @@ class ShizukuWorker(private val appContext: Context) {
     private var fakeInstallSource = ""
 
     private var dInitSucceeded = false
+    private var dhizukuInitialized = false
+    private var shizukuInitialized = false
     private val dRequestPermissionMutex by lazy { Mutex(locked = true) }
     private var dPermissionGranted = false
 
@@ -70,34 +74,71 @@ class ShizukuWorker(private val appContext: Context) {
     init {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P)
             HiddenApiBypass.addHiddenApiExemptions("Landroid/content", "Landroid/os")
-        dInitSucceeded = Dhizuku.init(appContext)
-        if (!dInitSucceeded) {
+    }
+
+    fun setInstallerMode(mode: InstallerMode) {
+        installerMode = mode
+    }
+
+    private fun ensureDhizukuInitialized(): Boolean {
+        if (!dhizukuInitialized) {
+            dInitSucceeded = Dhizuku.init(appContext)
+            dhizukuInitialized = true
+        }
+        return dInitSucceeded
+    }
+
+    private fun ensureShizukuInitialized() {
+        if (!shizukuInitialized) {
             val isSui = Sui.init(appContext.packageName)
-            if (!isSui) {  // Not sure if it's needed
+            if (!isSui) {
                 ShizukuProvider.enableMultiProcessSupport(false)
                 ShizukuProvider.requestBinderForNonProviderProcess(appContext)
             }
             Shizuku.addBinderReceivedListenerSticky(binderReceivedListener)
             Shizuku.addBinderDeadListener(binderDeadListener)
             Shizuku.addRequestPermissionResultListener(requestPermissionResultListener)
+            shizukuInitialized = true
         }
     }
 
     fun exit() {
-        if (dInitSucceeded) return
+        if (!shizukuInitialized) return
         Shizuku.removeBinderReceivedListener(binderReceivedListener)
         Shizuku.removeBinderDeadListener(binderDeadListener)
         Shizuku.removeRequestPermissionResultListener(requestPermissionResultListener)
     }
 
+    private suspend fun checkDhizukuPermission(): String {
+        if (!ensureDhizukuInitialized()) {
+            return "services_not_found"
+        }
+        if (Dhizuku.isPermissionGranted()) {
+            return "granted_owner"
+        }
+        Dhizuku.requestPermission(object : DhizukuRequestPermissionListener() {
+            @Throws(RemoteException::class)
+            override fun onRequestPermission(grantResult: Int) {
+                dPermissionGranted = grantResult == PackageManager.PERMISSION_GRANTED
+                dRequestPermissionMutex.unlock()
+            }
+        })
+        dRequestPermissionMutex.lock()
+        return if (dPermissionGranted) "granted_owner" else "denied"
+    }
+
     private suspend fun checkShizukuPermission(): String {
+        ensureShizukuInitialized()
+        if (!isBinderAvailable) {
+            return "services_not_found"
+        }
         return if (Shizuku.isPreV11()) {
             "old_shizuku"
         } else if (Shizuku.checkSelfPermission() == PackageManager.PERMISSION_GRANTED) {
             if (!registerUidObserverPermissionLimitedCheck()) {
                 "granted_" + if (isRoot) "root" else "adb"
             } else "old_android_with_adb"
-        } else if (Shizuku.shouldShowRequestPermissionRationale()) {  // "Deny and don't ask again"
+        } else if (Shizuku.shouldShowRequestPermissionRationale()) {
             "denied"
         } else {
             Shizuku.requestPermission(requestPermissionCode)
@@ -111,31 +152,13 @@ class ShizukuWorker(private val appContext: Context) {
     }
 
     suspend fun checkPermission(): String {
-        return if (!isBinderAvailable and !dInitSucceeded) {
-            "services_not_found"
-        } else if (dInitSucceeded) {
-            if (Dhizuku.isPermissionGranted())
-                "granted_owner"
-            else {
-                Dhizuku.requestPermission(object : DhizukuRequestPermissionListener() {
-                    @Throws(RemoteException::class)
-                    override fun onRequestPermission(grantResult: Int) {
-                        dPermissionGranted = grantResult == PackageManager.PERMISSION_GRANTED
-                        dRequestPermissionMutex.unlock()
-                    }
-                })
-                dRequestPermissionMutex.lock()
-                if (dPermissionGranted)
-                    "granted_owner"
-                else if (isBinderAvailable)
-                    checkShizukuPermission()
-                else
-                    "denied"
-            }
-        } else checkShizukuPermission()
+        return when (installerMode) {
+            InstallerMode.DHIZUKU -> checkDhizukuPermission()
+            InstallerMode.SHIZUKU -> checkShizukuPermission()
+        }
     }
 
-    /**
+  /**
      * Android 8.0 with ADB lacks IActivityManager#registerUidObserver permission,
      * so we can't install apps without activity
      */
@@ -143,6 +166,9 @@ class ShizukuWorker(private val appContext: Context) {
         isRoot = Shizuku.getUid() == 0
         return !isRoot and (Build.VERSION.SDK_INT < Build.VERSION_CODES.O_MR1)
     }
+
+    private fun useDhizukuBackend(): Boolean =
+        installerMode == InstallerMode.DHIZUKU && ensureDhizukuInitialized()
 
     // Thanks to https://github.com/LSPosed/LSPatch and https://gitlab.com/AuroraOSS/AuroraStore
 
@@ -175,15 +201,6 @@ class ShizukuWorker(private val appContext: Context) {
             Refine.unsafeCast(
                 PackageInstallerHidden(iPackageInstaller, installerPackageName, userId))
         }
-        /*
-        DEPRECATED
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O)
-        ...
-        else {
-            Refine.unsafeCast(PackageInstallerHidden(
-                appContext, appContext.packageManager, iPackageInstaller, installerPackageName, userId))
-        }
-        */
     }
 
     private val packageInstallerD: PackageInstaller by lazy {
@@ -225,8 +242,8 @@ class ShizukuWorker(private val appContext: Context) {
         return Refine.unsafeCast(PackageInstallerHidden.SessionHidden(iSession))
     }
 
-    private fun createPackageInstallerSessionUniversal(): PackageInstaller.Session {
-        return if (dInitSucceeded)
+    private fun createPackageInstallerSessionForMode(): PackageInstaller.Session {
+        return if (useDhizukuBackend())
             createPackageInstallerSessionD()
         else
             createPackageInstallerSession()
@@ -238,15 +255,21 @@ class ShizukuWorker(private val appContext: Context) {
      * @param fakeInstallSource set install source app package name
      */
     suspend fun installAPKs(apkURIs: List<String>, fakeInstallSource: String = ""): Int {
-        if (!dInitSucceeded) isRoot = Shizuku.getUid() == 0
+        if (installerMode == InstallerMode.SHIZUKU) {
+            ensureShizukuInitialized()
+            isRoot = Shizuku.getUid() == 0
+        } else if (!ensureDhizukuInitialized()) {
+            return PackageInstaller.STATUS_FAILURE
+        }
         this.fakeInstallSource = fakeInstallSource
         var status = PackageInstaller.STATUS_FAILURE
+        val dhizukuBackend = useDhizukuBackend()
         withContext(Dispatchers.IO) {
             runCatching {
-                createPackageInstallerSessionUniversal().use { session ->
+                createPackageInstallerSessionForMode().use { session ->
                     apkURIs.forEachIndexed { index, uriString ->
                         val uri = uriString.toUri()
-                        val stream = (if (dInitSucceeded)
+                        val stream = (if (dhizukuBackend)
                             contextD.contentResolver.openInputStream(uri)
                         else
                             appContext.contentResolver.openInputStream(uri)) ?: throw IOException("Cannot open input stream")
@@ -289,6 +312,12 @@ class ShizukuWorker(private val appContext: Context) {
      */
     @SuppressLint("MissingPermission")
     suspend fun uninstallPackage(packageName: String): Int {
+        if (installerMode == InstallerMode.SHIZUKU) {
+            ensureShizukuInitialized()
+        } else if (!ensureDhizukuInitialized()) {
+            return PackageInstaller.STATUS_FAILURE
+        }
+        val dhizukuBackend = useDhizukuBackend()
         var status = PackageInstaller.STATUS_FAILURE
         withContext(Dispatchers.IO) {
             runCatching {
@@ -299,7 +328,7 @@ class ShizukuWorker(private val appContext: Context) {
                         cont.resume(Unit)
                     }
                     val intentSender = IntentSenderHelper.newIntentSender(adapter)
-                    if (dInitSucceeded)
+                    if (dhizukuBackend)
                         packageInstallerD.uninstall(packageName, intentSender)
                     else
                         packageInstaller.uninstall(packageName, intentSender)

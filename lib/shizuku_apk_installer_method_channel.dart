@@ -16,6 +16,11 @@ class MethodChannelShizukuApkInstaller extends ShizukuApkInstallerPlatform {
   }
 
   @override
+  Future<void> setInstallerMode(String mode) async {
+    await methodChannel.invokeMethod<void>('setInstallerMode', {'mode': mode});
+  }
+
+  @override
   Future<String?> checkPermission() async {
     final permission = await methodChannel.invokeMethod<String?>('checkPermission');
     return permission;

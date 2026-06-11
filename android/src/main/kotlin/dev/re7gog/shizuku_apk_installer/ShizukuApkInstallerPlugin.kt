@@ -42,6 +42,24 @@ class ShizukuApkInstallerPlugin: FlutterPlugin, MethodCallHandler {
             return
         }
         when (call.method) {
+            "setInstallerMode" -> {
+                val mode: String? = call.argument("mode")
+                if (mode == null) {
+                    result!!.error(
+                        "error",
+                        "Missing argument",
+                        "mode is null"
+                    )
+                    return
+                }
+                worker!!.setInstallerMode(
+                    when (mode) {
+                        "dhizuku" -> InstallerMode.DHIZUKU
+                        else -> InstallerMode.SHIZUKU
+                    }
+                )
+                result!!.success(null)
+            }
             "checkPermission" -> {
                 job = CoroutineScope(Dispatchers.Default).async {
                     val res = worker!!.checkPermission()
